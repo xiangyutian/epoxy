@@ -35,126 +35,135 @@ import java.util.concurrent.Executor
 internal class PagedListModelCache<T>(
     private val modelBuilder: (itemIndex: Int, item: T?) -> EpoxyModel<*>,
     private val rebuildCallback: () -> Unit,
-    private val itemDiffCallback : DiffUtil.ItemCallback<T>,
-    private val diffExecutor : Executor? = null,
-    private val modelBuildingHandler : Handler
+    itemDiffCallback: DiffUtil.ItemCallback<T>,
+    private val diffExecutor: Executor? = null,
+    private val modelBuildingHandler: Handler
 ) {
-  /**
-   * Backing list for built models. This is a full array list that has null items for not yet build models.
-   */
-  private val modelCache = arrayListOf<EpoxyModel<*>?>()
-  /**
-   * Tracks the last accessed position so that we can report it back to the paged list when models are built.
-   */
-  private var lastPosition: Int? = null
+    /**
+     * Backing list for built models. This is a full array list that has null items for not yet build models.
+     *
+     * All interactions with this should by synchronized, since it is accessed from several threads
+     * for model building, paged list updates, and cache clearing.
+     */
+    private val modelCache = arrayListOf<EpoxyModel<*>?>()
+    /**
+     * Tracks the last accessed position so that we can report it back to the paged list when models are built.
+     */
+    private var lastPosition: Int? = null
 
-  /**
-   * Observer for the PagedList changes that invalidates the model cache when data is updated.
-   */
-  private val updateCallback = object : ListUpdateCallback {
-    override fun onChanged(position: Int, count: Int, payload: Any?) {
-      (position until (position + count)).forEach {
-        modelCache[it] = null
-      }
-      rebuildCallback()
-    }
-
-    override fun onMoved(fromPosition: Int, toPosition: Int) {
-        val model = modelCache.removeAt(fromPosition)
-        modelCache.add(toPosition, model)
-        rebuildCallback()
-    }
-
-    override fun onInserted(position: Int, count: Int) {
-        (0 until count).forEach { _ ->
-          modelCache.add(position, null)
+    /**
+     * Observer for the PagedList changes that invalidates the model cache when data is updated.
+     */
+    private val updateCallback = object : ListUpdateCallback {
+        @Synchronized
+        override fun onChanged(position: Int, count: Int, payload: Any?) {
+            (position until (position + count)).forEach {
+                modelCache[it] = null
+            }
+            rebuildCallback()
         }
-        rebuildCallback()
-    }
 
-    override fun onRemoved(position: Int, count: Int) {
-        (0 until count).forEach { _ ->
-          modelCache.removeAt(position)
+        @Synchronized
+        override fun onMoved(fromPosition: Int, toPosition: Int) {
+            val model = modelCache.removeAt(fromPosition)
+            modelCache.add(toPosition, model)
+            rebuildCallback()
         }
-        rebuildCallback()
-    }
-  }
 
-  private val asyncDiffer = @SuppressLint("RestrictedApi")
-  object : AsyncPagedListDiffer<T>(
-      updateCallback,
-      AsyncDifferConfig.Builder<T>(
-          itemDiffCallback
-      ).also {builder ->
-        if (diffExecutor != null) {
-          builder.setBackgroundThreadExecutor(diffExecutor)
+        @Synchronized
+        override fun onInserted(position: Int, count: Int) {
+            (0 until count).forEach {
+                modelCache.add(position, null)
+            }
+            rebuildCallback()
         }
-        // we have to reply on this private API, otherwise, paged list might be changed when models are being built,
-        // potentially creating concurrent modification problems.
-        builder.setMainThreadExecutor {runnable : Runnable ->
-          modelBuildingHandler.post(runnable)
+
+        @Synchronized
+        override fun onRemoved(position: Int, count: Int) {
+            (0 until count).forEach {
+                modelCache.removeAt(position)
+            }
+            rebuildCallback()
         }
-      }.build()
-  ){
-      init {
-          if (modelBuildingHandler != EpoxyController.defaultModelBuildingHandler) {
-              try {
-                  // looks like AsyncPagedListDiffer in 1.x ignores the config.
-                  // Reflection to the rescue.
-                  val mainThreadExecutorField =
-                      AsyncPagedListDiffer::class.java.getDeclaredField("mMainThreadExecutor")
-                  mainThreadExecutorField.isAccessible = true
-                  mainThreadExecutorField.set(this, Executor {
-                      modelBuildingHandler.post(it)
-                  })
-              } catch (t : Throwable) {
-                  val msg = "Failed to hijack update handler in AsyncPagedListDiffer." +
-                          "You can only build models on the main thread"
-                  Log.e("PagedListModelCache", msg, t)
-                  throw IllegalStateException(msg, t)
-              }
-          }
-      }
-  }
-
-  fun submitList(pagedList: PagedList<T>?) {
-    asyncDiffer.submitList(pagedList)
-  }
-
-  private fun getOrBuildModel(pos: Int): EpoxyModel<*> {
-    modelCache[pos]?.let {
-      return it
     }
-    return modelBuilder(pos, asyncDiffer.currentList?.get(pos)).also {
-      modelCache[pos] = it
-    }
-  }
 
-  fun getModels(): List<EpoxyModel<*>> {
-    (0 until modelCache.size).forEach {
-      getOrBuildModel(it)
-    }
-    lastPosition?.let {
-      triggerLoadAround(it)
-    }
-    @Suppress("UNCHECKED_CAST")
-    return modelCache as List<EpoxyModel<*>>
-  }
+    @SuppressLint("RestrictedApi")
+    private val asyncDiffer = object : AsyncPagedListDiffer<T>(
+        updateCallback,
+        AsyncDifferConfig.Builder<T>(
+            itemDiffCallback
+        ).also { builder ->
+            if (diffExecutor != null) {
+                builder.setBackgroundThreadExecutor(diffExecutor)
+            }
 
-  fun clearModels() {
-    modelCache.fill(null)
-  }
-
-  fun loadAround(position: Int) {
-    triggerLoadAround(position)
-    lastPosition = position
-  }
-
-  private fun triggerLoadAround(position: Int) {
-    asyncDiffer.currentList?.let {
-      if (it.size > 0) {
-        it.loadAround(Math.min(position, it.size - 1))
-      }
+            // we have to reply on this private API, otherwise, paged list might be changed when models are being built,
+            // potentially creating concurrent modification problems.
+            builder.setMainThreadExecutor { runnable: Runnable ->
+                modelBuildingHandler.post(runnable)
+            }
+        }.build()
+    ) {
+        init {
+            if (modelBuildingHandler != EpoxyController.defaultModelBuildingHandler) {
+                try {
+                    // looks like AsyncPagedListDiffer in 1.x ignores the config.
+                    // Reflection to the rescue.
+                    val mainThreadExecutorField =
+                        AsyncPagedListDiffer::class.java.getDeclaredField("mMainThreadExecutor")
+                    mainThreadExecutorField.isAccessible = true
+                    mainThreadExecutorField.set(this, Executor {
+                        modelBuildingHandler.post(it)
+                    })
+                } catch (t: Throwable) {
+                    val msg = "Failed to hijack update handler in AsyncPagedListDiffer." +
+                            "You can only build models on the main thread"
+                    Log.e("PagedListModelCache", msg, t)
+                    throw IllegalStateException(msg, t)
+                }
+            }
+        }
     }
-  }
+
+    fun submitList(pagedList: PagedList<T>?) {
+        asyncDiffer.submitList(pagedList)
+    }
+
+    @Synchronized
+    fun getModels(): List<EpoxyModel<*>> {
+        val currentList = asyncDiffer.currentList
+        (0 until modelCache.size).forEach { position ->
+            if (modelCache[position] != null) {
+                return@forEach
+            }
+
+            modelBuilder(position, currentList?.get(position)).also {
+                modelCache[position] = it
+            }
+        }
+
+        lastPosition?.let {
+            triggerLoadAround(it)
+        }
+        @Suppress("UNCHECKED_CAST")
+        return modelCache as List<EpoxyModel<*>>
+    }
+
+    @Synchronized
+    fun clearModels() {
+        modelCache.fill(null)
+    }
+
+    fun loadAround(position: Int) {
+        triggerLoadAround(position)
+        lastPosition = position
+    }
+
+    private fun triggerLoadAround(position: Int) {
+        asyncDiffer.currentList?.let {
+            if (it.size > 0) {
+                it.loadAround(Math.min(position, it.size - 1))
+            }
+        }
+    }
 }
